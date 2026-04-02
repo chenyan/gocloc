@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/hhatto/gocloc"
 	"github.com/jessevdk/go-flags"
+	"golang.org/x/term"
 )
 
 // Version is version string for gocloc command
@@ -31,6 +34,11 @@ const OutputTypeJSON string = "json"
 
 // OutputTypeMarkdown is Markdown output format for --output-type option
 const OutputTypeMarkdown string = "markdown"
+
+const (
+	ansiBrightYellow = "\x1b[93m"
+	ansiReset        = "\x1b[0m"
+)
 
 const (
 	fileHeader             string = "File"
@@ -60,6 +68,7 @@ type CmdOptions struct {
 	SkipDuplicated bool   `long:"skip-duplicated" description:"skip duplicated files"`
 	ShowLang       bool   `long:"show-lang" description:"print about all languages and extensions"`
 	ShowVersion    bool   `long:"version" description:"print version info"`
+	Depth          int    `long:"depth" short:"d" default:"0" description:"show per-directory statistics up to this many levels below each PATH (0=disabled); implies language summary per folder, indented as a tree"`
 }
 
 type outputBuilder struct {
@@ -274,6 +283,232 @@ func (o *outputBuilder) WriteResult() {
 	o.WriteFooter()
 }
 
+// langAgg holds aggregated counts for one language under one directory.
+type langAgg struct {
+	files    int32
+	blanks   int32
+	comments int32
+	code     int32
+}
+
+type langRow struct {
+	name     string
+	files    int32
+	blanks   int32
+	comments int32
+	code     int32
+}
+
+func absPathRoots(paths []string) ([]string, error) {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		a, err := filepath.Abs(p)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, filepath.Clean(a))
+	}
+	return out, nil
+}
+
+func rootForPath(fileAbs string, roots []string) (string, bool) {
+	var best string
+	var bestLen int
+	for _, r := range roots {
+		if fileAbs == r || strings.HasPrefix(fileAbs, r+string(os.PathSeparator)) {
+			if len(r) > bestLen {
+				best = r
+				bestLen = len(r)
+			}
+		}
+	}
+	return best, best != ""
+}
+
+func splitDirParts(dirRel string) []string {
+	if dirRel == "." || dirRel == "" {
+		return nil
+	}
+	parts := strings.Split(dirRel, string(os.PathSeparator))
+	var clean []string
+	for _, p := range parts {
+		if p != "" && p != "." {
+			clean = append(clean, p)
+		}
+	}
+	return clean
+}
+
+func aggregateByDepth(result *gocloc.Result, absRoots []string, depth int) map[string]map[string]*langAgg {
+	dirs := make(map[string]map[string]*langAgg)
+
+	add := func(dirKey, lang string, cf *gocloc.ClocFile) {
+		m := dirs[dirKey]
+		if m == nil {
+			m = make(map[string]*langAgg)
+			dirs[dirKey] = m
+		}
+		la := m[lang]
+		if la == nil {
+			la = &langAgg{}
+			m[lang] = la
+		}
+		la.files++
+		la.blanks += cf.Blanks
+		la.comments += cf.Comments
+		la.code += cf.Code
+	}
+
+	for _, cf := range result.Files {
+		fileAbs, err := filepath.Abs(cf.Name)
+		if err != nil {
+			continue
+		}
+		fileAbs = filepath.Clean(fileAbs)
+		root, ok := rootForPath(fileAbs, absRoots)
+		if !ok {
+			continue
+		}
+		rel, err := filepath.Rel(root, fileAbs)
+		if err != nil {
+			continue
+		}
+		add(root, cf.Lang, cf)
+		dirRel := filepath.Dir(rel)
+		parts := splitDirParts(dirRel)
+		for i := 1; i <= depth && i <= len(parts); i++ {
+			sub := filepath.Join(append([]string{root}, parts[0:i]...)...)
+			add(sub, cf.Lang, cf)
+		}
+	}
+	return dirs
+}
+
+func sortLangRows(rows []langRow, sortTag string) {
+	sort.Slice(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		switch sortTag {
+		case "name":
+			return a.name < b.name
+		case "files":
+			if a.files == b.files {
+				return a.code > b.code
+			}
+			return a.files > b.files
+		case "comment":
+			if a.comments == b.comments {
+				return a.code > b.code
+			}
+			return a.comments > b.comments
+		case "blank":
+			if a.blanks == b.blanks {
+				return a.code > b.code
+			}
+			return a.blanks > b.blanks
+		default:
+			return a.code > b.code
+		}
+	})
+}
+
+func dirLabel(rootAbs, displayRoot string, dirAbs string) string {
+	if dirAbs == rootAbs {
+		if displayRoot != "" {
+			return displayRoot
+		}
+		return dirAbs
+	}
+	rel, err := filepath.Rel(rootAbs, dirAbs)
+	if err != nil || rel == "." {
+		return dirAbs
+	}
+	return rel
+}
+
+func writeDepthDirTable(opts *CmdOptions, linePrefix string, langs map[string]*langAgg) {
+	if len(langs) == 0 {
+		return
+	}
+	var rows []langRow
+	for name, la := range langs {
+		rows = append(rows, langRow{
+			name: name, files: la.files, blanks: la.blanks, comments: la.comments, code: la.code,
+		})
+	}
+	sortLangRows(rows, opts.SortTag)
+
+	for _, r := range rows {
+		fmt.Printf("%s%-27v %6v %14v %14v %14v\n",
+			linePrefix, r.name, r.files, r.blanks, r.comments, r.code)
+	}
+}
+
+func collectChildDirs(all map[string]map[string]*langAgg, parent string) []string {
+	var out []string
+	for k := range all {
+		if k == parent {
+			continue
+		}
+		if filepath.Dir(k) == parent {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func depthDirColorOn() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+func printDepthDirectoryLine(indent, label string) {
+	if depthDirColorOn() {
+		fmt.Printf("%s%s%s%s\n", indent, ansiBrightYellow, label, ansiReset)
+		return
+	}
+	fmt.Printf("%s%s\n", indent, label)
+}
+
+func writeDepthTree(opts *CmdOptions, dirs map[string]map[string]*langAgg, rootAbs, displayRoot string, depth int) {
+	var walk func(dirAbs string, level int)
+	walk = func(dirAbs string, level int) {
+		indent := strings.Repeat("    ", level)
+		label := dirLabel(rootAbs, displayRoot, dirAbs)
+		printDepthDirectoryLine(indent, label)
+		linePrefix := indent + "    "
+		writeDepthDirTable(opts, linePrefix, dirs[dirAbs])
+		if level >= depth {
+			return
+		}
+		for _, ch := range collectChildDirs(dirs, dirAbs) {
+			walk(ch, level+1)
+		}
+	}
+	walk(rootAbs, 0)
+}
+
+func writeDepthResult(opts *CmdOptions, result *gocloc.Result, paths []string, depth int) error {
+	absRoots, err := absPathRoots(paths)
+	if err != nil {
+		return err
+	}
+	dirs := aggregateByDepth(result, absRoots, depth)
+	if len(dirs) == 0 {
+		return nil
+	}
+	for i, rootAbs := range absRoots {
+		if i > 0 {
+			fmt.Println()
+		}
+		display := paths[i]
+		writeDepthTree(opts, dirs, rootAbs, display, depth)
+	}
+	return nil
+}
+
 func main() {
 	var opts CmdOptions
 	clocOpts := gocloc.NewClocOptions()
@@ -308,6 +543,21 @@ func main() {
 	// check sort tag option with other options
 	if opts.ByFile && opts.SortTag == "files" {
 		fmt.Println("`--sort files` option cannot be used in conjunction with the `--by-file` option")
+		os.Exit(1)
+	}
+
+	if opts.Depth > 0 {
+		if opts.ByFile {
+			fmt.Println("`--depth` cannot be used with `--by-file`")
+			os.Exit(1)
+		}
+		if opts.OutputType != OutputTypeDefault {
+			fmt.Println("`--depth` only supports `--output-type default`")
+			os.Exit(1)
+		}
+	}
+	if opts.Depth < 0 {
+		fmt.Println("`--depth` must be >= 0")
 		os.Exit(1)
 	}
 
@@ -350,6 +600,14 @@ func main() {
 	result, err := processor.Analyze(paths)
 	if err != nil {
 		fmt.Printf("fail gocloc analyze. error: %v\n", err)
+		return
+	}
+
+	if opts.Depth > 0 {
+		if err := writeDepthResult(&opts, result, paths, opts.Depth); err != nil {
+			fmt.Printf("depth output: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
