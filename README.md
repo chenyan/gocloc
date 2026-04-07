@@ -1,5 +1,36 @@
 # gocloc
 
+**Latest commit**  (2026-04-03): Add directory tree statistics with `--depth` flag
+
+- Added `--depth` to control per-directory tree depth (`0` disables); shows language counts in a tree-like layout
+- Directory aggregation and tree traversal
+- ANSI colors for directory names in terminals
+- Validation for `--depth` conflicts with other options
+- Dependency update: `golang.org/x/term` (terminal detection)
+
+With `--depth`, output is grouped by directory so you can see how code is spread across the tree.
+
+```bash
+[11:44:08] ➜  claude-code-main gocloc -d 1 .
+.
+    TypeScript                    2586          36002         102744         377899
+    Markdown                         7            158              4            598
+    JSON                            11              0              0            235
+    JavaScript                      10              2              4             57
+    JSX                              1              0              1              2
+    Plain Text                       1              1              0              0
+    packages
+        TypeScript                      11            173            141           1249
+        JSON                             9              0              0             83
+    src
+        TypeScript                    2575          35829         102603         376650
+        JavaScript                      10              2              4             57
+        Markdown                         3              0              0              3
+        JSX                              1              0              1              2
+        Plain Text                       1              1              0              0
+```
+
+
 [![GoDoc](https://godoc.org/github.com/hhatto/gocloc?status.svg)](https://godoc.org/github.com/hhatto/gocloc)
 [![ci](https://github.com/hhatto/gocloc/workflows/Go/badge.svg)](https://github.com/hhatto/gocloc/actions)
 [![Go Report Card](https://goreportcard.com/badge/github.com/hhatto/gocloc)](https://goreportcard.com/report/github.com/hhatto/gocloc)
@@ -8,6 +39,8 @@
 
 A little fast [cloc(Count Lines Of Code)](https://github.com/AlDanial/cloc), written in Go.
 Inspired by [tokei](https://github.com/Aaronepower/tokei).
+
+
 
 ## Installation
 
